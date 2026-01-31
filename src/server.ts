@@ -64,6 +64,20 @@ app.post("/api/chat", async (req: Request, res: Response) => {
     conversation.messages = result.messages as BaseMessage[];
     conversation.conversationCount = result.conversationCount as number;
 
+    // Check if human approval is needed (HITL)
+    if (result.needsApproval && result.approvalMessage) {
+      console.log("[Server] Human approval needed, returning approval message");
+      return res.json({
+        response: result.approvalMessage,
+        intent: result.userIntent,
+        conversationCount: result.conversationCount,
+        toolsUsed: [],
+        toolCallDetails: [],
+        needsApproval: true,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
     // Get the last message (bot's response)
     const lastMessage = conversation.messages[conversation.messages.length - 1];
 
@@ -94,6 +108,7 @@ app.post("/api/chat", async (req: Request, res: Response) => {
       conversationCount: result.conversationCount,
       toolsUsed: toolsUsed,
       toolCallDetails: toolCallDetails,
+      needsApproval: false,
       timestamp: new Date().toISOString(),
     });
   } catch (error: any) {

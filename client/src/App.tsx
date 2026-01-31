@@ -13,6 +13,7 @@ interface Message {
   intent?: string;
   toolsUsed?: string[];
   toolCallDetails?: ToolCallDetail[];
+  needsApproval?: boolean;  // HITL flag
 }
 
 function App() {
@@ -71,6 +72,7 @@ function App() {
         intent: data.intent,
         toolsUsed: data.toolsUsed || [],
         toolCallDetails: data.toolCallDetails || [],
+        needsApproval: data.needsApproval || false,
       };
 
       setMessages(prev => [...prev, botMessage]);
@@ -198,6 +200,14 @@ function App() {
                       style={{ backgroundColor: getIntentColor(msg.intent) }}
                     >
                       {getIntentEmoji(msg.intent)} {msg.intent}
+                    </span>
+                  )}
+                  {msg.needsApproval && (
+                    <span
+                      className="message-approval"
+                      style={{ backgroundColor: '#FF9800', color: 'white' }}
+                    >
+                      ⚠️ Needs Clarification
                     </span>
                   )}
                   {msg.toolsUsed && msg.toolsUsed.length > 0 && (

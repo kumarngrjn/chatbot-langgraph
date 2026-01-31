@@ -26,6 +26,19 @@ const ChatStateAnnotation = Annotation.Root({
     reducer: (x, y) => y ?? x,
     default: () => 0,
   }),
+  // Human-in-the-Loop (HITL) fields
+  needsApproval: Annotation<boolean>({
+    reducer: (x, y) => y ?? x,
+    default: () => false,
+  }),
+  pendingToolCalls: Annotation<any[]>({
+    reducer: (x, y) => y ?? x,
+    default: () => [],
+  }),
+  approvalMessage: Annotation<string>({
+    reducer: (x, y) => y ?? x,
+    default: () => "",
+  }),
 });
 
 // Extract the TypeScript type from the annotation
@@ -109,9 +122,11 @@ async function handleQuestion(state: ChatState) {
 }
 
 /**
- * LANGGRAPH CONCEPT 4: TOOL CALLING
+ * LANGGRAPH CONCEPT 4: PARALLEL TOOL CALLING
  *
  * This node executes tools that the LLM has decided to call.
+ * IMPORTANT: Tools are executed IN PARALLEL for better performance.
+ * If multiple tools are requested, they all run simultaneously.
  * Tool results are added back to the message history so the LLM can use them.
  */
 async function callTools(state: ChatState) {
@@ -125,40 +140,162 @@ async function callTools(state: ChatState) {
     return { messages: [] };
   }
 
-  // Execute each tool call
-  const toolMessages: ToolMessage[] = [];
+  console.log(`[Tool Executor] Executing ${toolCalls.length} tool(s) in parallel...`);
+  const startTime = Date.now();
 
-  for (const toolCall of toolCalls) {
-    console.log(`[Tool Executor] Calling tool: ${toolCall.name} with args:`, toolCall.args);
+  // Execute all tool calls in parallel using Promise.allSettled
+  // This ensures that if one tool fails, others still complete
+  const toolPromises = toolCalls.map(async (toolCall) => {
+    console.log(`[Tool Executor] Starting tool: ${toolCall.name} with args:`, toolCall.args);
 
     // Find the matching tool
     const tool = tools.find(t => t.name === toolCall.name);
 
-    if (tool) {
-      try {
-        // Use type assertion to handle the union type
-        const result = await (tool as any).invoke(toolCall.args);
-        console.log(`[Tool Executor] Tool ${toolCall.name} returned:`, result);
+    if (!tool) {
+      console.error(`[Tool Executor] Tool not found: ${toolCall.name}`);
+      return {
+        toolCall,
+        result: null,
+        error: `Tool "${toolCall.name}" not found`
+      };
+    }
 
-        toolMessages.push(
-          new ToolMessage({
-            content: typeof result === 'string' ? result : JSON.stringify(result),
-            tool_call_id: toolCall.id!,
-          })
-        );
-      } catch (error: any) {
-        console.error(`[Tool Executor] Error calling tool ${toolCall.name}:`, error.message);
-        toolMessages.push(
-          new ToolMessage({
-            content: `Error: ${error.message}`,
-            tool_call_id: toolCall.id!,
-          })
-        );
+    try {
+      // Use type assertion to handle the union type
+      const result = await (tool as any).invoke(toolCall.args);
+      console.log(`[Tool Executor] Tool ${toolCall.name} completed successfully`);
+      return {
+        toolCall,
+        result,
+        error: null
+      };
+    } catch (error: any) {
+      console.error(`[Tool Executor] Error calling tool ${toolCall.name}:`, error.message);
+      return {
+        toolCall,
+        result: null,
+        error: error.message
+      };
+    }
+  });
+
+  // Wait for all tools to complete
+  const results = await Promise.all(toolPromises);
+  const endTime = Date.now();
+  console.log(`[Tool Executor] All ${toolCalls.length} tool(s) completed in ${endTime - startTime}ms`);
+
+  // Convert results to ToolMessages
+  const toolMessages: ToolMessage[] = results.map(({ toolCall, result, error }) => {
+    const content = error
+      ? `Error: ${error}`
+      : (typeof result === 'string' ? result : JSON.stringify(result));
+
+    return new ToolMessage({
+      content,
+      tool_call_id: toolCall.id!,
+    });
+  });
+
+  return { messages: toolMessages, needsApproval: false, pendingToolCalls: [], approvalMessage: "" };
+}
+
+/**
+ * LANGGRAPH CONCEPT 5: HUMAN-IN-THE-LOOP (HITL)
+ *
+ * This node validates tool calls before execution and can request human approval
+ * for ambiguous or sensitive operations.
+ *
+ * Uses LLM-driven validation: Claude autonomously decides if clarification is needed.
+ */
+async function validateToolCalls(state: ChatState) {
+  console.log("[Validation] Checking tool calls for approval requirements...");
+
+  const lastMessage = state.messages[state.messages.length - 1] as AIMessage;
+  const toolCalls = lastMessage.tool_calls || [];
+
+  // Create a validation model (using Haiku for fast, cheap validation)
+  const validationModel = new ChatAnthropic({
+    modelName: "claude-haiku-4-5-20251001",
+    anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+    maxTokens: 150,
+    temperature: 0,
+  });
+
+  // Check for ambiguous weather queries using LLM
+  for (const toolCall of toolCalls) {
+    if (toolCall.name === "get_weather") {
+      const location = toolCall.args.location as string;
+
+      // Only validate single-word locations (those without state/country specified)
+      const isSingleWord = !location.includes(',') && !location.includes(' ');
+
+      if (isSingleWord) {
+        console.log(`[Validation] Asking LLM to evaluate location ambiguity: ${location}`);
+
+        const validationPrompt = `Is "${location}" an ambiguous location name that could refer to multiple cities in different places?
+
+Examples:
+- "Paris" is AMBIGUOUS - could mean Paris, France or Paris, Texas
+- "Springfield" is AMBIGUOUS - exists in many US states (Illinois, Massachusetts, Missouri, etc.)
+- "Seattle" is CLEAR - primarily refers to Seattle, Washington
+- "Tokyo" is CLEAR - clearly refers to Tokyo, Japan
+
+Format your response as follows:
+- If CLEAR: respond with just "CLEAR"
+- If AMBIGUOUS: respond with "AMBIGUOUS: <location1>, <location2>, ..."
+  Example: "AMBIGUOUS: Paris, France; Paris, Texas; Paris, Tennessee"`;
+
+        try {
+          const response = await validationModel.invoke([
+            { role: "user", content: validationPrompt }
+          ]);
+
+          const answer = response.content.toString().trim();
+          console.log(`[Validation] LLM response for "${location}": ${answer}`);
+
+          if (answer.toUpperCase().includes("AMBIGUOUS")) {
+            console.log(`[Validation] LLM detected ambiguous location: ${location}`);
+
+            // Extract the examples from the LLM response
+            // Format: "AMBIGUOUS: Paris, France; Paris, Texas; Paris, Tennessee"
+            let examples = "";
+            const colonIndex = answer.indexOf(":");
+            if (colonIndex > -1) {
+              // Get the part after "AMBIGUOUS:"
+              const examplesPart = answer.substring(colonIndex + 1).trim();
+              // Split by semicolon and take first 2-3 examples
+              const exampleList = examplesPart.split(";").map(e => e.trim()).filter(e => e.length > 0);
+              examples = exampleList.slice(0, 3).map(e => `"${e}"`).join(" or ");
+            }
+
+            // Fallback if we couldn't extract examples
+            if (!examples) {
+              examples = `"${location}, [State/Country]"`;
+            }
+
+            // Create a ToolMessage to satisfy Anthropic's requirement that each tool_use has a tool_result
+            const clarificationMessage = new ToolMessage({
+              content: `[Requesting clarification] The location "${location}" is ambiguous. Asking user to specify.`,
+              tool_call_id: toolCall.id!,
+            });
+
+            return {
+              messages: [clarificationMessage],
+              needsApproval: true,
+              pendingToolCalls: toolCalls,
+              approvalMessage: `I found that "${location}" could refer to multiple cities. To get accurate weather data, could you please specify which ${location} you mean? For example: ${examples}`,
+            };
+          }
+        } catch (error: any) {
+          console.error(`[Validation] Error during LLM validation:`, error.message);
+          // On error, fail safe and continue without blocking
+        }
       }
     }
   }
 
-  return { messages: toolMessages };
+  console.log("[Validation] All tool calls approved");
+  return { needsApproval: false };
 }
 
 /**
@@ -184,7 +321,7 @@ function routeByIntent(state: ChatState) {
 
 /**
  * Router that checks if tools need to be called
- * This creates an agent loop: question -> tools -> question -> end
+ * This creates an agent loop: question -> validation -> tools -> question -> end
  */
 function shouldContinue(state: ChatState) {
   const lastMessage = state.messages[state.messages.length - 1] as AIMessage;
@@ -194,8 +331,8 @@ function shouldContinue(state: ChatState) {
   console.log("[Router] Tool calls:", JSON.stringify(toolCalls, null, 2));
 
   if (toolCalls.length > 0) {
-    console.log(`[Router] Found ${toolCalls.length} tool call(s), routing to tool executor`);
-    return "tools";
+    console.log(`[Router] Found ${toolCalls.length} tool call(s), routing to validation`);
+    return "validate";
   } else {
     console.log("[Router] No tool calls, ending conversation turn");
     return END;
@@ -203,14 +340,31 @@ function shouldContinue(state: ChatState) {
 }
 
 /**
- * Build and configure the LangGraph workflow with tool calling
+ * Router that checks if human approval is needed before executing tools
+ */
+function needsApprovalRouter(state: ChatState) {
+  console.log("[Router] Checking if approval is needed...");
+
+  if (state.needsApproval) {
+    console.log("[Router] Approval needed, pausing for human input");
+    return END;  // Return to user with approval message
+  } else {
+    console.log("[Router] No approval needed, proceeding to execute tools");
+    return "tools";
+  }
+}
+
+/**
+ * Build and configure the LangGraph workflow with Human-in-the-Loop (HITL)
  *
  * Graph flow:
  * START -> analyzeIntent -> [greeting/farewell/question]
  *   - greeting -> END
  *   - farewell -> END
- *   - question -> [tools or END]
- *       - if tool_calls exist -> callTools -> question (agent loop)
+ *   - question -> [validate or END]
+ *       - if tool_calls exist -> validate -> [tools or END]
+ *           - if needs approval -> END (ask user for clarification)
+ *           - else -> callTools -> question (agent loop)
  *       - else -> END
  */
 export function createChatbot() {
@@ -221,6 +375,7 @@ export function createChatbot() {
     .addNode("greeting", handleGreeting)
     .addNode("farewell", handleFarewell)
     .addNode("question", handleQuestion)
+    .addNode("validate", validateToolCalls)  // HITL validation node
     .addNode("tools", callTools)
     // Define the flow: START -> analyzeIntent
     .addEdge(START, "analyzeIntent")
@@ -229,8 +384,10 @@ export function createChatbot() {
     // Greeting and farewell go directly to END
     .addEdge("greeting", END)
     .addEdge("farewell", END)
-    // Question handler checks if tools need to be called (agent loop)
+    // Question handler checks if tools need to be called
     .addConditionalEdges("question", shouldContinue)
+    // Validate tools before execution (HITL checkpoint)
+    .addConditionalEdges("validate", needsApprovalRouter)
     // After tools are called, go back to question handler for final response
     .addEdge("tools", "question");
 

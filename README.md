@@ -29,14 +29,16 @@ Nodes are functions that process the state. This chatbot has five nodes:
 ### 3. Conditional Routing
 The `routeByIntent` function dynamically determines which node to execute next based on the detected intent, enabling flexible conversation flow.
 
-### 4. Tool Calling (Agent Loop)
+### 4. Tool Calling (Agent Loop) with Parallel Execution
 The chatbot can use external tools:
 - **Calculator**: Performs arithmetic operations
-- **Weather**: Gets weather for major cities
-- **Search**: Searches for information
+- **Weather**: Gets real-time weather data for US cities (api.weather.gov)
+- **Search**: Web search with AI-powered summaries (Tavily API)
 
-When a question requires a tool, the graph creates an agent loop:
-`question → tool execution → question → final answer`
+When a question requires tools, the graph creates an agent loop:
+`question → parallel tool execution → question → final answer`
+
+**Key Feature:** When multiple tools are needed, they execute **in parallel** for faster responses!
 
 See [TOOL_CALLING.md](TOOL_CALLING.md) for detailed documentation.
 
