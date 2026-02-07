@@ -3,6 +3,57 @@ import { z } from "zod";
 import axios from "axios";
 
 /**
+ * Simple in-memory cache with TTL (Time-To-Live)
+ * Used to avoid redundant API calls for the same queries
+ */
+interface CacheEntry<T> {
+  value: T;
+  expiresAt: number;
+}
+
+class ToolCache<T> {
+  private cache = new Map<string, CacheEntry<T>>();
+  private ttlMs: number;
+
+  constructor(ttlMinutes: number = 5) {
+    this.ttlMs = ttlMinutes * 60 * 1000;
+  }
+
+  get(key: string): T | null {
+    const entry = this.cache.get(key);
+    if (!entry) {
+      return null;
+    }
+
+    if (Date.now() > entry.expiresAt) {
+      this.cache.delete(key);
+      console.log(`[Cache] Expired entry removed: ${key}`);
+      return null;
+    }
+
+    console.log(`[Cache] HIT: ${key}`);
+    return entry.value;
+  }
+
+  set(key: string, value: T): void {
+    this.cache.set(key, {
+      value,
+      expiresAt: Date.now() + this.ttlMs,
+    });
+    console.log(`[Cache] SET: ${key} (expires in ${this.ttlMs / 1000}s)`);
+  }
+
+  clear(): void {
+    this.cache.clear();
+    console.log(`[Cache] Cleared all entries`);
+  }
+}
+
+// Initialize caches with different TTLs
+const weatherCache = new ToolCache<string>(5);  // 5-minute TTL for weather
+const searchCache = new ToolCache<string>(10);  // 10-minute TTL for search
+
+/**
  * Calculator tool - performs basic arithmetic operations
  */
 export const calculatorTool = tool(
@@ -41,6 +92,16 @@ export const calculatorTool = tool(
  */
 export const weatherTool = tool(
   async ({ location }) => {
+    // Normalize the cache key (lowercase, trimmed)
+    const cacheKey = location.toLowerCase().trim();
+
+    // Check cache first
+    const cachedResult = weatherCache.get(cacheKey);
+    if (cachedResult) {
+      console.log(`[Weather Tool] Returning cached result for: ${location}`);
+      return cachedResult;
+    }
+
     try {
       // Step 1: Geocode the location using Nominatim (free, no API key needed)
       console.log(`[Weather Tool] Geocoding location: ${location}`);
@@ -89,11 +150,16 @@ export const weatherTool = tool(
 
       const currentPeriod = forecastResponse.data.properties.periods[0];
 
-      return `Weather in ${display_name}:
+      const result = `Weather in ${display_name}:
 Temperature: ${currentPeriod.temperature}°${currentPeriod.temperatureUnit}
 Condition: ${currentPeriod.shortForecast}
 Wind: ${currentPeriod.windSpeed} ${currentPeriod.windDirection}
 Forecast: ${currentPeriod.detailedForecast}`;
+
+      // Cache the successful result
+      weatherCache.set(cacheKey, result);
+
+      return result;
 
     } catch (error: any) {
       if (error.response?.status === 404) {
@@ -125,6 +191,16 @@ export const searchTool = tool(
 
     if (!apiKey) {
       return `Search tool requires a Tavily API key. Please add TAVILY_API_KEY to your .env file. Get a free API key at https://tavily.com`;
+    }
+
+    // Normalize the cache key (lowercase, trimmed)
+    const cacheKey = query.toLowerCase().trim();
+
+    // Check cache first
+    const cachedResult = searchCache.get(cacheKey);
+    if (cachedResult) {
+      console.log(`[Search Tool] Returning cached result for: ${query}`);
+      return cachedResult;
     }
 
     try {
@@ -169,6 +245,9 @@ export const searchTool = tool(
       } else {
         result += "No results found.";
       }
+
+      // Cache the successful result
+      searchCache.set(cacheKey, result);
 
       return result;
 

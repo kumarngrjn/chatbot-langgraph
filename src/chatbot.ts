@@ -1,6 +1,7 @@
 import { ChatAnthropic } from "@langchain/anthropic";
-import { StateGraph, END, START, Annotation } from "@langchain/langgraph";
+import { StateGraph, END, START, Annotation, MemorySaver } from "@langchain/langgraph";
 import { BaseMessage, AIMessage, ToolMessage } from "@langchain/core/messages";
+import { BaseCheckpointSaver } from "@langchain/langgraph";
 import { tools } from "./tools";
 
 /**
@@ -51,26 +52,71 @@ type ChatState = typeof ChatStateAnnotation.State;
  * Each node receives the current state and returns updates to it.
  */
 
-// Node 1: Analyze user intent
+// Node 1: Analyze user intent using LLM for nuanced detection
 async function analyzeIntent(state: ChatState) {
   const lastMessage = state.messages[state.messages.length - 1];
-  const userInput = lastMessage.content.toString().toLowerCase();
+  const userInput = lastMessage.content.toString();
 
-  let intent: "greeting" | "question" | "farewell" | "unknown" = "unknown";
+  console.log(`[Intent Analyzer] Analyzing intent with LLM...`);
 
-  if (userInput.match(/\b(hi|hello|hey|greetings)\b/)) {
-    intent = "greeting";
-  } else if (userInput.match(/\b(bye|goodbye|see you|farewell)\b/)) {
-    intent = "farewell";
-  } else {
-    intent = "question";
+  // Use Claude Haiku for fast, cheap intent classification
+  const intentModel = new ChatAnthropic({
+    modelName: "claude-haiku-4-5-20251001",
+    anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+    maxTokens: 50,
+    temperature: 0,
+  });
+
+  const intentPrompt = `Classify the user's intent into exactly ONE of these categories:
+- "greeting": User is saying hello, hi, hey, good morning, etc.
+- "farewell": User is saying goodbye, bye, see you, take care, etc.
+- "question": User is asking a question, requesting information, or giving a command
+
+User message: "${userInput}"
+
+Respond with ONLY the category name (greeting, farewell, or question), nothing else.`;
+
+  try {
+    const response = await intentModel.invoke([
+      { role: "user", content: intentPrompt }
+    ]);
+
+    const detectedIntent = response.content.toString().trim().toLowerCase();
+
+    // Map the response to valid intent types
+    let intent: "greeting" | "question" | "farewell" | "unknown" = "unknown";
+    if (detectedIntent.includes("greeting")) {
+      intent = "greeting";
+    } else if (detectedIntent.includes("farewell")) {
+      intent = "farewell";
+    } else if (detectedIntent.includes("question")) {
+      intent = "question";
+    } else {
+      // Default to question for unrecognized intents
+      intent = "question";
+    }
+
+    console.log(`[Intent Analyzer] LLM detected intent: ${intent}`);
+
+    return {
+      userIntent: intent,
+    };
+  } catch (error: any) {
+    console.error(`[Intent Analyzer] LLM error, falling back to regex: ${error.message}`);
+
+    // Fallback to simple regex matching if LLM fails
+    const lowerInput = userInput.toLowerCase();
+    let intent: "greeting" | "question" | "farewell" | "unknown" = "question";
+
+    if (lowerInput.match(/\b(hi|hello|hey|greetings)\b/)) {
+      intent = "greeting";
+    } else if (lowerInput.match(/\b(bye|goodbye|see you|farewell)\b/)) {
+      intent = "farewell";
+    }
+
+    console.log(`[Intent Analyzer] Fallback detected intent: ${intent}`);
+    return { userIntent: intent };
   }
-
-  console.log(`[Intent Analyzer] Detected intent: ${intent}`);
-
-  return {
-    userIntent: intent,
-  };
 }
 
 // Node 2: Handle greetings
@@ -366,8 +412,14 @@ function needsApprovalRouter(state: ChatState) {
  *           - if needs approval -> END (ask user for clarification)
  *           - else -> callTools -> question (agent loop)
  *       - else -> END
+ *
+ * LANGGRAPH CONCEPT 6: PERSISTENCE WITH CHECKPOINTING
+ *
+ * Checkpointing enables conversation persistence across invocations.
+ * Each conversation is identified by a thread_id in the config.
+ * The checkpointer stores state (messages, etc.) between calls.
  */
-export function createChatbot() {
+export function createChatbot(checkpointer?: BaseCheckpointSaver) {
   // Initialize the state graph using the Annotation (LangGraph v1.x API)
   const graph = new StateGraph(ChatStateAnnotation)
     // Add all nodes to the graph
@@ -391,6 +443,9 @@ export function createChatbot() {
     // After tools are called, go back to question handler for final response
     .addEdge("tools", "question");
 
-  // Compile the graph into a runnable
-  return graph.compile();
+  // Compile the graph with optional checkpointer for persistence
+  return graph.compile({ checkpointer });
 }
+
+// Export MemorySaver for convenience
+export { MemorySaver };

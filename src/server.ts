@@ -2,8 +2,8 @@ import express, { Request, Response } from "express";
 import cors from "cors";
 import bodyParser from "body-parser";
 import * as dotenv from "dotenv";
-import { HumanMessage, BaseMessage, AIMessage } from "@langchain/core/messages";
-import { createChatbot } from "./chatbot";
+import { HumanMessage, AIMessage } from "@langchain/core/messages";
+import { createChatbot, MemorySaver } from "./chatbot";
 
 // Load environment variables
 dotenv.config();
@@ -15,16 +15,22 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(bodyParser.json());
 
-// Store conversations in memory (in production, use a database)
-interface Conversation {
-  messages: BaseMessage[];
-  conversationCount: number;
-}
+/**
+ * LANGGRAPH PERSISTENCE
+ *
+ * MemorySaver stores conversation state in memory.
+ * Each conversation is identified by a unique thread_id.
+ * State persists across requests but not server restarts.
+ *
+ * For production, use SqliteSaver or PostgresSaver for persistent storage.
+ */
+const checkpointer = new MemorySaver();
 
-const conversations = new Map<string, Conversation>();
+// Create chatbot instance with checkpointer for persistence
+const chatbot = createChatbot(checkpointer);
 
-// Create chatbot instance
-const chatbot = createChatbot();
+// Track conversation counts separately (not part of graph state for simplicity)
+const conversationCounts = new Map<string, number>();
 
 // Health check endpoint
 app.get("/api/health", (req: Request, res: Response) => {
@@ -40,29 +46,32 @@ app.post("/api/chat", async (req: Request, res: Response) => {
       return res.status(400).json({ error: "Message is required" });
     }
 
-    // Get or create conversation for this session
-    let conversation = conversations.get(sessionId);
-    if (!conversation) {
-      conversation = {
-        messages: [],
-        conversationCount: 0,
-      };
-      conversations.set(sessionId, conversation);
-    }
+    // Get or initialize conversation count
+    const currentCount = conversationCounts.get(sessionId) || 0;
 
-    // Add user message
-    conversation.messages.push(new HumanMessage(message));
+    // Configure the thread for persistence
+    const config = {
+      configurable: {
+        thread_id: sessionId,
+      },
+    };
 
-    // Invoke the chatbot
-    const result = await chatbot.invoke({
-      messages: conversation.messages,
-      userIntent: "unknown" as const,
-      conversationCount: conversation.conversationCount,
-    });
+    console.log(`[Server] Processing message for thread: ${sessionId}`);
 
-    // Update conversation state
-    conversation.messages = result.messages as BaseMessage[];
-    conversation.conversationCount = result.conversationCount as number;
+    // Invoke the chatbot with just the new message
+    // The checkpointer handles message history automatically
+    const result = await chatbot.invoke(
+      {
+        messages: [new HumanMessage(message)],
+        userIntent: "unknown" as const,
+        conversationCount: currentCount,
+      },
+      config
+    );
+
+    // Update conversation count
+    const newCount = (result.conversationCount as number) || currentCount + 1;
+    conversationCounts.set(sessionId, newCount);
 
     // Check if human approval is needed (HITL)
     if (result.needsApproval && result.approvalMessage) {
@@ -70,7 +79,7 @@ app.post("/api/chat", async (req: Request, res: Response) => {
       return res.json({
         response: result.approvalMessage,
         intent: result.userIntent,
-        conversationCount: result.conversationCount,
+        conversationCount: newCount,
         toolsUsed: [],
         toolCallDetails: [],
         needsApproval: true,
@@ -79,22 +88,23 @@ app.post("/api/chat", async (req: Request, res: Response) => {
     }
 
     // Get the last message (bot's response)
-    const lastMessage = conversation.messages[conversation.messages.length - 1];
+    const messages = result.messages as AIMessage[];
+    const lastMessage = messages[messages.length - 1];
 
     // Extract tools used from the conversation
     const toolsUsed: string[] = [];
-    const toolCallDetails: Array<{name: string, args: any}> = [];
-    for (const msg of conversation.messages) {
+    const toolCallDetails: Array<{ name: string; args: Record<string, unknown> }> = [];
+    for (const msg of messages) {
       if (msg._getType() === "ai") {
         const aiMsg = msg as AIMessage;
         if (aiMsg.tool_calls && aiMsg.tool_calls.length > 0) {
-          aiMsg.tool_calls.forEach(tc => {
+          aiMsg.tool_calls.forEach((tc) => {
             if (!toolsUsed.includes(tc.name)) {
               toolsUsed.push(tc.name);
             }
             toolCallDetails.push({
               name: tc.name,
-              args: tc.args
+              args: tc.args as Record<string, unknown>,
             });
           });
         }
@@ -105,7 +115,7 @@ app.post("/api/chat", async (req: Request, res: Response) => {
     res.json({
       response: lastMessage.content,
       intent: result.userIntent,
-      conversationCount: result.conversationCount,
+      conversationCount: newCount,
       toolsUsed: toolsUsed,
       toolCallDetails: toolCallDetails,
       needsApproval: false,
@@ -120,31 +130,50 @@ app.post("/api/chat", async (req: Request, res: Response) => {
   }
 });
 
-// Get conversation history
-app.get("/api/conversation/:sessionId", (req: Request, res: Response) => {
-  const sessionId = req.params.sessionId as string;
-  const conversation = conversations.get(sessionId);
+// Get conversation history from checkpointer
+app.get("/api/conversation/:sessionId", async (req: Request, res: Response) => {
+  try {
+    const sessionId = req.params.sessionId as string;
 
-  if (!conversation) {
-    return res.json({
+    // Get state from checkpointer
+    const config = { configurable: { thread_id: sessionId } };
+    const state = await chatbot.getState(config);
+
+    if (!state || !state.values || !state.values.messages) {
+      return res.json({
+        messages: [],
+        conversationCount: 0,
+      });
+    }
+
+    const messages = state.values.messages as AIMessage[];
+
+    res.json({
+      messages: messages.map((msg) => ({
+        role: msg._getType() === "human" ? "user" : "assistant",
+        content: msg.content,
+      })),
+      conversationCount: conversationCounts.get(sessionId) || 0,
+    });
+  } catch (error: any) {
+    console.error("Error getting conversation:", error);
+    res.json({
       messages: [],
       conversationCount: 0,
     });
   }
-
-  res.json({
-    messages: conversation.messages.map((msg) => ({
-      role: msg._getType() === "human" ? "user" : "assistant",
-      content: msg.content,
-    })),
-    conversationCount: conversation.conversationCount,
-  });
 });
 
 // Clear conversation
-app.delete("/api/conversation/:sessionId", (req: Request, res: Response) => {
+app.delete("/api/conversation/:sessionId", async (req: Request, res: Response) => {
   const sessionId = req.params.sessionId as string;
-  conversations.delete(sessionId);
+
+  // Clear the conversation count
+  conversationCounts.delete(sessionId);
+
+  // Note: MemorySaver doesn't have a delete method, but we can reset by tracking
+  // For full deletion, you'd need to use a persistent checkpointer like SqliteSaver
+
   res.json({ success: true });
 });
 
@@ -152,5 +181,6 @@ app.delete("/api/conversation/:sessionId", (req: Request, res: Response) => {
 app.listen(PORT, () => {
   console.log(`\n🚀 Server is running on http://localhost:${PORT}`);
   console.log(`📡 API endpoint: http://localhost:${PORT}/api/chat`);
+  console.log(`💾 Persistence: MemorySaver (in-memory)`);
   console.log(`\n✨ LangGraph Chatbot Backend Ready!\n`);
 });
